@@ -1,0 +1,223 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 LlamaIndex Inc.
+"""
+Ticks (events) that drive the control loop.
+
+The control loop waits for ticks to arrive, then processes them through a reducer
+to produce updated state and commands. Ticks represent all the different kinds of
+events that can occur during workflow execution:
+  - New events added to the workflow
+  - Step function execution completing
+  - Timeout occurring
+  - User cancellation
+  - External event publishing requests
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Literal
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    TypeAdapter,
+)
+from workflows.context.serializers import _register_framework_types
+from workflows.events import SerializableEvent, SerializableOptionalException
+from workflows.runtime.types.results import (
+    EmissionKey,
+    SentEvent,
+    SerializableCollectionReleasePayload,
+    StepFunctionResult,
+)
+from workflows.runtime.types.step_id import StepId
+
+# Pre-StepId journals serialized this field as ``step_name``; accept both so
+# persisted ticks still deserialize. New ticks serialize under ``step_id``.
+_STEP_ID_ALIAS = AliasChoices("step_id", "step_name")
+
+
+class TickStepResult(BaseModel):
+    """When processed, executes a step function and publishes the result"""
+
+    model_config = ConfigDict(
+        frozen=True, arbitrary_types_allowed=True, populate_by_name=True
+    )
+    type: Literal["step_result"] = "step_result"
+    step_id: StepId = Field(validation_alias=_STEP_ID_ALIAS)
+    worker_id: int
+    invocation_namespace: tuple[str, ...] = Field(default=(), exclude=True)
+    event: SerializableEvent
+    result: list[Annotated[StepFunctionResult, Discriminator("type")]]
+    # Wall-clock stamp recorded before ``on_tick`` journaling, so replay reads
+    # the same time the live run used instead of the replay clock. Additive:
+    # old journals default to None and fall back to the reducer's ``now``.
+    stamped_at: float | None = None
+    # Older results have no invocation ID. Match those by worker_id.
+    invocation_id: str | None = None
+    # The reducer records sends still awaiting delivery, in call order.
+    sends: list[SentEvent] = Field(default_factory=list)
+
+
+class TickAddEvent(BaseModel):
+    """When sent, adds an event to the workflow's event queue"""
+
+    model_config = ConfigDict(
+        frozen=True, arbitrary_types_allowed=True, populate_by_name=True
+    )
+    type: Literal["add_event"] = "add_event"
+    event: SerializableEvent
+    step_id: StepId | None = Field(default=None, validation_alias=_STEP_ID_ALIAS)
+    bound_events: dict[str, SerializableEvent] | None = None
+    origin_namespace: tuple[str, ...] = Field(default=(), exclude=True)
+    attempts: int | None = None
+    first_attempt_at: float | None = None
+    last_exception: SerializableOptionalException = None
+    last_failed_at: float | None = None
+    recovery_counts: dict[str, int] = Field(default_factory=dict)
+    scope_path: tuple[str, ...] = Field(default_factory=tuple)
+    # Collect-invocation work record. A payload-carrying tick is routed
+    # directly to the binding's target step, before waiter matching and the
+    # member-arrival path.
+    collection_release_payload: SerializableCollectionReleasePayload = None
+    # Stable identity for this work item when re-delivering suspended work.
+    work_item_id: str | None = None
+    # See TickStepResult.stamped_at.
+    stamped_at: float | None = None
+    # Step sends and queue commands use emission keys to reject duplicates.
+    # Start events, external sends and rehydration ticks have no key.
+    emission: EmissionKey | None = None
+
+
+class TickCancelRun(BaseModel):
+    """When processed, cancels the workflow run"""
+
+    model_config = ConfigDict(frozen=True)
+    type: Literal["cancel_run"] = "cancel_run"
+
+
+class TickIdleRelease(BaseModel):
+    """When processed, cleanly releases the workflow due to idleness"""
+
+    model_config = ConfigDict(frozen=True)
+    type: Literal["idle_release"] = "idle_release"
+
+
+class TickPublishEvent(BaseModel):
+    """When sent, publishes an event to workflow consumers, e.g. a UI or a callback"""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+    type: Literal["publish_event"] = "publish_event"
+    event: SerializableEvent
+
+
+class TickTimeout(BaseModel):
+    """When processed, times the workflow out, cancelling it"""
+
+    model_config = ConfigDict(frozen=True)
+    type: Literal["timeout"] = "timeout"
+    timeout: float
+    stamped_at: float | None = None
+
+
+class TickWaiterTimeout(BaseModel):
+    """When processed, marks a specific waiter as timed out and replays the step."""
+
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+    type: Literal["waiter_timeout"] = "waiter_timeout"
+    step_id: StepId = Field(validation_alias=_STEP_ID_ALIAS)
+    waiter_id: str
+    invocation_namespace: tuple[str, ...] = Field(default=(), exclude=True)
+    stamped_at: float | None = None
+
+
+class TickSessionStart(BaseModel):
+    """Session-start marker journaled at each ``run()`` start and resume.
+
+    Drives the elapsed-alive timeout budget: it marks the boundary between alive
+    sessions, resetting every broker's ``last_alive_stamp`` without accruing, so
+    the inter-session gap (downtime) never enters any broker's budget — on the
+    snapshot-resume path and the full-journal-replay path identically. Additive
+    to the journal; old journals simply lack it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+    type: Literal["session_start"] = "session_start"
+    stamped_at: float | None = None
+
+
+class TickIdleCheck(BaseModel):
+    """Scheduled after state appears idle, to re-check after async sends run.
+
+    Appended to tick_buffer when the reducer sees quiescent state. Processed
+    on the next loop iteration after asyncio.sleep(0), giving in-flight
+    ctx.send_event() calls a chance to deliver.
+    """
+
+    model_config = ConfigDict(frozen=True)
+    type: Literal["idle_check"] = "idle_check"
+
+
+class TickWakeup(BaseModel):
+    """Poke that flips due delayed attempts to eligible and re-checks queues.
+
+    ``due`` is the absolute adapter-get_now time this wakeup was scheduled
+    for (a delayed retry's ``not_before``). Reducing the tick clears
+    ``not_before`` on queued attempts that are due. Eligibility is derived
+    from the journaled tick, never from the current clock, so replaying a
+    tick stream makes the same dispatch decisions as the live run.
+
+    Carries no work-item data: the queued attempt lives in BrokerState, so
+    dropping a wakeup can never lose work — resume re-arms it from the queue.
+    """
+
+    model_config = ConfigDict(frozen=True)
+    type: Literal["wakeup"] = "wakeup"
+    due: float
+    stamped_at: float | None = None
+
+
+# Ticks that carry a journaled wall-clock stamp. See TickStepResult.stamped_at.
+STAMPED_TICK_TYPES = (
+    TickStepResult,
+    TickAddEvent,
+    TickTimeout,
+    TickWaiterTimeout,
+    TickSessionStart,
+    TickWakeup,
+)
+
+WorkflowTick = Annotated[
+    TickStepResult
+    | TickAddEvent
+    | TickCancelRun
+    | TickPublishEvent
+    | TickTimeout
+    | TickWaiterTimeout
+    | TickSessionStart
+    | TickIdleCheck
+    | TickIdleRelease
+    | TickWakeup,
+    Discriminator("type"),
+]
+
+# Concrete roots written by the outer JSON tick persistence format. Nested
+# result variants are reconstructed by WorkflowTick's discriminated unions.
+_WORKFLOW_TICK_TYPES = (
+    TickStepResult,
+    TickAddEvent,
+    TickCancelRun,
+    TickPublishEvent,
+    TickTimeout,
+    TickWaiterTimeout,
+    TickSessionStart,
+    TickIdleCheck,
+    TickIdleRelease,
+    TickWakeup,
+)
+_register_framework_types(*_WORKFLOW_TICK_TYPES)
+
+WorkflowTickAdapter: TypeAdapter[WorkflowTick] = TypeAdapter(WorkflowTick)

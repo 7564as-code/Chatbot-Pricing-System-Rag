@@ -1,0 +1,1041 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 LlamaIndex Inc.
+
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Mapping, TypeVar
+
+from pydantic import TypeAdapter
+from workflows._catch_error import _collect_catch_error_handlers
+from workflows._event_matching import step_accepts_type
+from workflows._stream_levels import event_types, stream_level_types_by_producer
+from workflows.collect import Collect, Take
+from workflows.context.context_types import (
+    CURRENT_SERIALIZED_VERSION,
+    SerializedCollectionReleasePayload,
+    SerializedCollectionReleaseState,
+    SerializedCollectionStreamInstance,
+    SerializedContext,
+    SerializedDelivery,
+    SerializedEventAttempt,
+    SerializedInProgressAttempt,
+    SerializedStepWorkerState,
+    SerializedWaiter,
+)
+from workflows.context.serializers import JsonSerializer
+from workflows.decorators import CatchErrorHandler, StepConfig
+from workflows.events import Event, SerializableEventType
+from workflows.retry_policy import RetryPolicy
+from workflows.runtime.types.commands import CommandQueueEvent
+from workflows.runtime.types.results import (
+    CollectionReleasePayload,
+    EmissionKey,
+    StepWorkerState,
+    StepWorkerWaiter,
+)
+from workflows.runtime.types.step_id import StepId
+from workflows.runtime.types.ticks import TickAddEvent, WorkflowTick
+from workflows.workflow import Workflow
+
+if TYPE_CHECKING:
+    from workflows.context.serializers import BaseSerializer
+
+
+T = TypeVar("T")
+
+
+def _normalize_step_id(value: Any) -> StepId:
+    return value if isinstance(value, StepId) else StepId.from_str(value)
+
+
+def _normalize_step_id_keys(mapping: Mapping[Any, T]) -> dict[StepId, T]:
+    return {_normalize_step_id(step_id): value for step_id, value in mapping.items()}
+
+
+@dataclass(frozen=True)
+class CollectionBinding:
+    """
+    Static typed stream binding from a finite list source to a collect step.
+
+    Bindings are computed once from step signatures and stored in BrokerConfig.
+    At runtime, each CollectionStreamInstance records the binding ids that may
+    accept events produced inside that stream.
+    """
+
+    id: str
+    source_step: StepId
+    target_step: StepId
+    item_types: tuple[type[Event], ...]
+    policy: Collect
+
+
+@dataclass()
+class CollectionStreamInstance:
+    """
+    One execution of a collection-producing step.
+
+    A returned ``list[E]`` opens one stream instance. Work emitted inside that
+    stream carries ``scope_path`` so downstream completions can decrement the
+    right open-work counter and close the nearest enclosing stream.
+    """
+
+    stream_id: str
+    source_step: StepId
+    scope_path: tuple[str, ...]
+    open_work_items: int = 0
+    accepting_binding_ids: tuple[str, ...] = ()
+
+    def _copy(self) -> CollectionStreamInstance:
+        return dataclasses.replace(self)
+
+
+@dataclass()
+class CollectionReleaseState:
+    """
+    Release state for one binding within one stream instance.
+
+    ``buffer`` stores member events until the binding's Collect policy releases
+    them. ``released`` makes the release fire-once: Take(n) sets it on the
+    n-th arrival, and stream close sets it for All() (or an unmet Take).
+    """
+
+    binding_id: str
+    stream_id: str
+    buffer: list[Event] = field(default_factory=list)
+    released: bool = False
+
+    def _copy(self) -> CollectionReleaseState:
+        return dataclasses.replace(self, buffer=list(self.buffer))
+
+
+@dataclass
+class Delivery:
+    """An event awaiting delivery.
+
+    The reducer records the event until it reduces the keyed ``TickAddEvent``.
+    Older results have no invocation ID. Their events use ``key=None`` and
+    are emitted without recording a delivery.
+    """
+
+    key: EmissionKey | None
+    event: Event
+    step_id: StepId | None
+    recovery_counts: dict[str, int]
+    scope_path: tuple[str, ...]
+
+    def to_command(self, origin_namespace: tuple[str, ...]) -> CommandQueueEvent:
+        """Build a queue command with the event's delivery key and routing details."""
+        return CommandQueueEvent(
+            event=self.event,
+            step_id=self.step_id,
+            origin_namespace=origin_namespace,
+            recovery_counts=dict(self.recovery_counts),
+            scope_path=self.scope_path,
+            emission=self.key,
+        )
+
+    def _copy(self) -> Delivery:
+        return dataclasses.replace(self, recovery_counts=dict(self.recovery_counts))
+
+
+@dataclass()
+class BrokerState:
+    """
+    Complete state of the workflow broker at a given point in time.
+
+    This is the primary state object passed through the control loop's reducer pattern.
+    Each tick processes this state and returns an updated copy along with commands to execute.
+
+    Attributes:
+        config: Immutable configuration for the workflow and all steps
+        workers: Mutable state for each step's worker pool, queues, and in-progress executions
+        stream_seq: Monotonic counter used to mint deterministic collection stream ids
+        streams: Open collection streams keyed by stream id
+        collection_release_states: Per-binding release buffers keyed by stream and binding
+        elapsed_alive: Known-alive seconds this broker has spent against its
+            timeout budget.
+        last_alive_stamp: Accrual reference point (the last stamp seen), reset by
+            session-start markers without accruing downtime.
+        invocation_seq: Counter incremented for each step dispatch.
+        deliveries: Pending events keyed by emission, in insertion order.
+            The reducer re-emits them at TickSessionStart.
+        journal_seq: Count of reduced ticks and the next record's sequence number.
+    """
+
+    is_running: bool
+    config: BrokerConfig
+    workers: dict[Any, InternalStepWorkerState]
+    stream_seq: int = 0
+    work_item_seq: int = 0
+    invocation_seq: int = 0
+    streams: dict[str, CollectionStreamInstance] = field(default_factory=dict)
+    collection_release_states: dict[str, CollectionReleaseState] = field(
+        default_factory=dict
+    )
+    children: dict[str, BrokerState] = field(default_factory=dict)
+    elapsed_alive: float = 0.0
+    last_alive_stamp: float | None = None
+    deliveries: dict[EmissionKey, Delivery] = field(default_factory=dict)
+    journal_seq: int = 0
+
+    def __post_init__(self) -> None:
+        self._normalize_worker_keys()
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        if "children" not in state:
+            self.children = {}
+        if "elapsed_alive" not in state:
+            self.elapsed_alive = 0.0
+        if "last_alive_stamp" not in state:
+            self.last_alive_stamp = None
+        if "invocation_seq" not in state:
+            self.invocation_seq = 0
+        if "deliveries" not in state:
+            self.deliveries = {}
+        if "journal_seq" not in state:
+            self.journal_seq = 0
+        self._normalize_worker_keys()
+
+    def _normalize_worker_keys(self) -> None:
+        self.workers = _normalize_step_id_keys(self.workers)
+
+    def deepcopy(self) -> BrokerState:
+        """
+        Deep-ish copy. Copies fields that are considered mutable during updates.
+        """
+        return BrokerState(
+            is_running=self.is_running,
+            config=self.config,  # immutable
+            workers={
+                step_id: worker_state._deepcopy()
+                for step_id, worker_state in self.workers.items()
+            },
+            stream_seq=self.stream_seq,
+            work_item_seq=self.work_item_seq,
+            invocation_seq=self.invocation_seq,
+            streams={sid: stream._copy() for sid, stream in self.streams.items()},
+            collection_release_states={
+                key: state._copy()
+                for key, state in self.collection_release_states.items()
+            },
+            children={key: child.deepcopy() for key, child in self.children.items()},
+            elapsed_alive=self.elapsed_alive,
+            last_alive_stamp=self.last_alive_stamp,
+            deliveries={key: d._copy() for key, d in self.deliveries.items()},
+            journal_seq=self.journal_seq,
+        )
+
+    @staticmethod
+    def from_workflow(workflow: Workflow) -> BrokerState:
+        state = BrokerState.from_config(workflow._get_broker_config())
+        state.is_running = False
+        return state
+
+    @staticmethod
+    def from_config(config: BrokerConfig) -> BrokerState:
+        return BrokerState(
+            is_running=True,
+            config=config,
+            workers={
+                step_id: InternalStepWorkerState(
+                    queue=[],
+                    config=step_config,
+                    in_progress=[],
+                    collected_events={},
+                    static_collect_events=[],
+                    collected_waiters=[],
+                )
+                for step_id, step_config in config.steps.items()
+            },
+        )
+
+    def rehydrate_with_ticks(self) -> list[WorkflowTick]:
+        """
+        Rehydrates non-serializable state by re-running commands
+        """
+        commands: list[WorkflowTick] = []
+        _rehydrate_broker(self, (), commands)
+        return commands
+
+    def to_serialized(self, serializer: BaseSerializer) -> SerializedContext:
+        """Serialize the broker state to a SerializedContext.
+
+        Raise if child brokers exist. Saving only the root would lose their work.
+        """
+        if self.children:
+            raise ValueError(
+                f"Cannot serialize child broker {min(self.children)!r}: child "
+                "brokers are not serialized."
+            )
+        return _broker_to_serialized(self, serializer)
+
+    @staticmethod
+    def from_serialized(
+        serialized: SerializedContext,
+        workflow: Workflow,
+        serializer: BaseSerializer,
+    ) -> BrokerState:
+        """Deserialize a SerializedContext into a BrokerState."""
+
+        serializer = serializer if serializer is not None else JsonSerializer()
+        base_state = BrokerState.from_workflow(workflow)
+        _load_broker_from_serialized(base_state, serialized, serializer)
+        return base_state
+
+
+def _internal_step_config(step_config: StepConfig) -> InternalStepConfig:
+    return InternalStepConfig(
+        accepted_events=step_config.accepted_events,
+        retry_policy=step_config.retry_policy,
+        num_workers=step_config.num_workers,
+        accept_event_subclasses=step_config.accept_event_subclasses,
+        collection_param=step_config.collection_param,
+        collect_params=step_config.collect_params,
+        collection_policy=step_config.collection_policy,
+    )
+
+
+def _rehydrate_broker(
+    state: BrokerState, path: tuple[str, ...], commands: list[WorkflowTick]
+) -> None:
+    for step_id, worker_state in sorted(state.workers.items(), key=lambda x: str(x[0])):
+        for waiter in sorted(worker_state.collected_waiters, key=lambda x: x.waiter_id):
+            if waiter.has_requirements and not waiter.requirements:
+                # Re-ping the step with its whole work record so the
+                # re-registered waiter keeps its stream scope and any
+                # collect batch.
+                commands.append(
+                    TickAddEvent(
+                        event=waiter.event,
+                        step_id=step_id,
+                        bound_events=waiter.bound_events,
+                        scope_path=waiter.scope_path,
+                        origin_namespace=path,
+                        collection_release_payload=waiter.collection_release_payload,
+                        work_item_id=waiter.work_item_id,
+                    )
+                )
+    for key, child in sorted(state.children.items()):
+        _rehydrate_broker(child, (*path, key), commands)
+
+
+def _broker_to_serialized(
+    state: BrokerState, serializer: BaseSerializer
+) -> SerializedContext:
+    workers_dict = {}
+    for step_id, worker_state in state.workers.items():
+        step_name = str(step_id)
+        # Serialize queue with retry and stream scope info
+        queue = [
+            SerializedEventAttempt(
+                event=serializer.serialize(attempt.event),
+                bound_events={
+                    name: serializer.serialize(event)
+                    for name, event in attempt.bound_events.items()
+                }
+                if attempt.bound_events is not None
+                else None,
+                attempts=attempt.attempts or 0,
+                first_attempt_at=attempt.first_attempt_at,
+                last_exception=attempt.last_exception,
+                last_failed_at=attempt.last_failed_at,
+                recovery_counts=dict(attempt.recovery_counts),
+                not_before=attempt.not_before,
+                scope_path=list(attempt.scope_path),
+                collection_release_payload=_serialize_release_payload(
+                    attempt.collection_release_payload, serializer
+                ),
+                work_item_id=attempt.work_item_id,
+            )
+            for attempt in worker_state.queue
+        ]
+        # Keep attempts in progress so replay can apply later ticks.
+        # TickSessionStart queues them again when the next session starts.
+        in_progress = [
+            SerializedInProgressAttempt(
+                event=serializer.serialize(ip.event),
+                bound_events={
+                    name: serializer.serialize(event)
+                    for name, event in ip.bound_events.items()
+                }
+                if ip.bound_events is not None
+                else None,
+                attempts=ip.attempts or 0,
+                first_attempt_at=ip.first_attempt_at,
+                last_exception=ip.last_exception,
+                last_failed_at=ip.last_failed_at,
+                recovery_counts=dict(ip.recovery_counts),
+                scope_path=list(ip.scope_path),
+                collection_release_payload=_serialize_release_payload(
+                    ip.shared_state.collection_release_payload, serializer
+                ),
+                work_item_id=ip.work_item_id,
+                worker_id=ip.worker_id,
+                invocation_id=ip.invocation_id,
+                received=sorted(ip.received),
+                collected_events={
+                    buffer_id: [serializer.serialize(ev) for ev in events]
+                    for buffer_id, events in ip.shared_state.collected_events.items()
+                },
+                collect_generations=dict(ip.collect_generations),
+            )
+            for ip in worker_state.in_progress
+        ]
+
+        # Serialize collected events
+        collected_events = {
+            buffer_id: [serializer.serialize(ev) for ev in events]
+            for buffer_id, events in worker_state.collected_events.items()
+        }
+
+        # Serialize waiters
+        waiters = [
+            SerializedWaiter(
+                waiter_id=waiter.waiter_id,
+                event=serializer.serialize(waiter.event),
+                bound_events={
+                    name: serializer.serialize(event)
+                    for name, event in waiter.bound_events.items()
+                }
+                if waiter.bound_events is not None
+                else None,
+                waiting_for_event=f"{waiter.waiting_for_event.__module__}.{waiter.waiting_for_event.__name__}",
+                has_requirements=bool(len(waiter.requirements))
+                or waiter.has_requirements,
+                resolved_event=serializer.serialize(waiter.resolved_event)
+                if waiter.resolved_event
+                else None,
+                scope_path=list(waiter.scope_path),
+                collection_release_payload=_serialize_release_payload(
+                    waiter.collection_release_payload, serializer
+                ),
+                work_item_id=waiter.work_item_id,
+            )
+            for waiter in worker_state.collected_waiters
+        ]
+
+        workers_dict[step_name] = SerializedStepWorkerState(
+            queue=queue,
+            in_progress=in_progress,
+            collected_events=collected_events,
+            collect_generations=dict(worker_state.collect_generations),
+            static_collect_events=[
+                serializer.serialize(ev) for ev in worker_state.static_collect_events
+            ],
+            collected_waiters=waiters,
+        )
+
+    return SerializedContext(
+        version=CURRENT_SERIALIZED_VERSION,
+        state={},  # State is filled separately by the state store
+        is_running=state.is_running,
+        workers=workers_dict,
+        stream_seq=state.stream_seq,
+        work_item_seq=state.work_item_seq,
+        invocation_seq=state.invocation_seq,
+        streams={
+            sid: SerializedCollectionStreamInstance(
+                stream_id=stream.stream_id,
+                source_step=str(stream.source_step),
+                scope_path=list(stream.scope_path),
+                open_work_items=stream.open_work_items,
+                accepting_binding_ids=list(stream.accepting_binding_ids),
+            )
+            for sid, stream in state.streams.items()
+        },
+        collection_release_states={
+            key: SerializedCollectionReleaseState(
+                binding_id=release.binding_id,
+                stream_id=release.stream_id,
+                buffer=[serializer.serialize(ev) for ev in release.buffer],
+                released=release.released,
+            )
+            for key, release in state.collection_release_states.items()
+        },
+        elapsed_alive=state.elapsed_alive,
+        last_alive_stamp=state.last_alive_stamp,
+        deliveries=[
+            SerializedDelivery(
+                invocation_id=key.invocation_id,
+                index=key.index,
+                event=serializer.serialize(delivery.event),
+                step_id=str(delivery.step_id) if delivery.step_id is not None else None,
+                recovery_counts=dict(delivery.recovery_counts),
+                scope_path=list(delivery.scope_path),
+            )
+            for key, delivery in state.deliveries.items()
+        ],
+        journal_seq=state.journal_seq,
+    )
+
+
+def _load_broker_from_serialized(
+    base_state: BrokerState, serialized: SerializedContext, serializer: BaseSerializer
+) -> None:
+    # Unfortunately, important to preserve this state, since the workflow needs to know this to decide
+    # whether to create a start_event from kwargs (it only constructs and passes a start event if not already running)
+    base_state.is_running = serialized.is_running
+    base_state.stream_seq = serialized.stream_seq
+    base_state.work_item_seq = serialized.work_item_seq
+    base_state.invocation_seq = serialized.invocation_seq
+    base_state.deliveries = {}
+    for data in serialized.deliveries:
+        key = EmissionKey(invocation_id=data.invocation_id, index=data.index)
+        base_state.deliveries[key] = Delivery(
+            key=key,
+            event=serializer.deserialize(data.event),
+            step_id=StepId.from_str(data.step_id) if data.step_id is not None else None,
+            recovery_counts=dict(data.recovery_counts),
+            scope_path=tuple(data.scope_path),
+        )
+    base_state.elapsed_alive = serialized.elapsed_alive
+    base_state.last_alive_stamp = serialized.last_alive_stamp
+    base_state.journal_seq = serialized.journal_seq
+    base_state.streams = {
+        sid: CollectionStreamInstance(
+            stream_id=stream.stream_id,
+            source_step=StepId.from_str(stream.source_step),
+            scope_path=tuple(stream.scope_path),
+            open_work_items=stream.open_work_items,
+            accepting_binding_ids=tuple(stream.accepting_binding_ids),
+        )
+        for sid, stream in serialized.streams.items()
+    }
+    base_state.collection_release_states = {
+        key: CollectionReleaseState(
+            binding_id=release.binding_id,
+            stream_id=release.stream_id,
+            buffer=[serializer.deserialize(ev) for ev in release.buffer],
+            released=release.released,
+        )
+        for key, release in serialized.collection_release_states.items()
+    }
+
+    # Restore worker state (queues, collected events, waiters)
+    # We do this regardless of is_running state so workflows can resume from where they left off
+    for step_key, worker_data in serialized.workers.items():
+        step_id = StepId.from_str(step_key)
+        if step_id not in base_state.workers:
+            continue
+
+        worker = base_state.workers[step_id]
+
+        # Queue older entries again because they have no invocation ID.
+        # Entries with IDs stay in progress so replay can apply later ticks.
+        legacy_in_progress = [
+            ip for ip in worker_data.in_progress if ip.invocation_id is None
+        ]
+        worker.queue = [
+            _deserialize_event_attempt(attempt, serializer)
+            for attempt in [*worker_data.queue, *legacy_in_progress]
+        ]
+
+        # Restore collected events
+        worker.collected_events = {
+            buffer_id: [serializer.deserialize(ev) for ev in events]
+            for buffer_id, events in worker_data.collected_events.items()
+        }
+        worker.collect_generations = dict(worker_data.collect_generations)
+        worker.static_collect_events = [
+            serializer.deserialize(ev) for ev in worker_data.static_collect_events
+        ]
+
+        # Restore waiters
+        worker.collected_waiters = []
+        for waiter_data in worker_data.collected_waiters:
+            waiter_payload = _deserialize_release_payload(
+                waiter_data.collection_release_payload, serializer
+            )
+            worker.collected_waiters.append(
+                StepWorkerWaiter(
+                    waiter_id=waiter_data.waiter_id,
+                    bound_events={
+                        name: serializer.deserialize(event)
+                        for name, event in waiter_data.bound_events.items()
+                    }
+                    if waiter_data.bound_events is not None
+                    else None,
+                    # For a suspended collect invocation the payload is the
+                    # authoritative record; the trigger event is derived
+                    # from it so the two cannot diverge on resume.
+                    event=waiter_payload.as_event()
+                    if waiter_payload is not None
+                    else serializer.deserialize(waiter_data.event),
+                    waiting_for_event=_import_event_type(
+                        waiter_data.waiting_for_event, serializer
+                    ),
+                    requirements={},
+                    has_requirements=waiter_data.has_requirements,
+                    resolved_event=serializer.deserialize(waiter_data.resolved_event)
+                    if waiter_data.resolved_event
+                    else None,
+                    scope_path=tuple(waiter_data.scope_path),
+                    collection_release_payload=waiter_payload,
+                    work_item_id=waiter_data.work_item_id,
+                )
+            )
+
+        worker.in_progress = [
+            _deserialize_in_progress(ip, step_id, worker, serializer)
+            for ip in worker_data.in_progress
+            if ip.invocation_id is not None
+        ]
+
+
+def _deserialize_in_progress(
+    data: SerializedInProgressAttempt,
+    step_id: StepId,
+    worker: InternalStepWorkerState,
+    serializer: BaseSerializer,
+) -> InProgressState:
+    """Restore the invocation and its buffers from dispatch time."""
+    attempt = _deserialize_event_attempt(data, serializer)
+    return InProgressState(
+        event=attempt.event,
+        bound_events=attempt.bound_events,
+        worker_id=data.worker_id or 0,
+        shared_state=StepWorkerState(
+            step_name=str(step_id),
+            collected_events={
+                buffer_id: [serializer.deserialize(ev) for ev in events]
+                for buffer_id, events in data.collected_events.items()
+            },
+            collected_waiters=[
+                dataclasses.replace(w) for w in worker.collected_waiters
+            ],
+            collection_release_payload=attempt.collection_release_payload,
+            scope_path=attempt.scope_path,
+            work_item_id=attempt.work_item_id,
+            invocation_id=data.invocation_id,
+        ),
+        attempts=attempt.attempts or 0,
+        first_attempt_at=attempt.first_attempt_at or 0.0,
+        last_exception=attempt.last_exception,
+        last_failed_at=attempt.last_failed_at,
+        recovery_counts=dict(attempt.recovery_counts),
+        scope_path=attempt.scope_path,
+        work_item_id=attempt.work_item_id,
+        invocation_id=data.invocation_id,
+        received=set(data.received),
+        collect_generations=dict(data.collect_generations),
+    )
+
+
+def _deserialize_event_attempt(
+    attempt: SerializedEventAttempt, serializer: BaseSerializer
+) -> EventAttempt:
+    """Restore one queued work item.
+
+    For a collect invocation the persisted payload is the authoritative
+    record; the trigger event is derived from it so the two cannot diverge
+    across a serialize/resume boundary.
+    """
+    payload = _deserialize_release_payload(
+        attempt.collection_release_payload, serializer
+    )
+    return EventAttempt(
+        event=payload.as_event()
+        if payload is not None
+        else serializer.deserialize(attempt.event),
+        bound_events={
+            name: serializer.deserialize(event)
+            for name, event in attempt.bound_events.items()
+        }
+        if attempt.bound_events is not None
+        else None,
+        attempts=attempt.attempts,
+        first_attempt_at=attempt.first_attempt_at,
+        last_exception=attempt.last_exception,
+        last_failed_at=attempt.last_failed_at,
+        recovery_counts=dict(attempt.recovery_counts),
+        not_before=attempt.not_before,
+        scope_path=tuple(attempt.scope_path),
+        collection_release_payload=payload,
+        work_item_id=attempt.work_item_id,
+    )
+
+
+_event_type_adapter = TypeAdapter(SerializableEventType)
+
+
+def _import_event_type(qualified_name: str, serializer: BaseSerializer) -> type[Event]:
+    """Resolve an event class name through the selected serializer."""
+    with serializer.validation_context():
+        return _event_type_adapter.validate_python(qualified_name)
+
+
+def _binding_id(
+    source_step: StepId,
+    target_step: StepId,
+    item_types: tuple[type[Event], ...],
+    policy: Collect,
+) -> str:
+    """Build a stable id for one static source-to-collect-step binding."""
+    type_names = ",".join(f"{t.__module__}.{t.__qualname__}" for t in item_types)
+    card = policy.cardinality
+    card_repr = f"Take({card.n})" if isinstance(card, Take) else type(card).__name__
+    return f"{source_step}->{target_step}:{type_names}:{card_repr}:nearest"
+
+
+def _compute_collection_bindings(
+    steps: dict[str, StepConfig],
+) -> dict[str, CollectionBinding]:
+    """
+    Compute static list[E] stream bindings from the workflow graph.
+
+    A fan-out source binds to a collection step when the collection step's item
+    type appears at the same stream level reachable from the source (see
+    :mod:`workflows._stream_levels` for the level traversal, shared with static
+    validation).
+    """
+    collects: dict[str, tuple[Any, ...]] = {
+        name: cfg.collection_param[1]
+        for name, cfg in steps.items()
+        if cfg.collection_param is not None
+    }
+
+    bindings: dict[str, CollectionBinding] = {}
+    for source_name, level_types in stream_level_types_by_producer(steps).items():
+        for target_name, collect_types in collects.items():
+            item_types = tuple(event_types(collect_types))
+            if not any(
+                step_accepts_type(
+                    produced,
+                    item_types,
+                    allow_subclasses=steps[target_name].accept_event_subclasses,
+                )
+                for produced in level_types
+            ):
+                continue
+            policy = steps[target_name].collection_policy
+            if policy is None:
+                continue
+            source_step = StepId((), source_name)
+            target_step = StepId((), target_name)
+            binding = CollectionBinding(
+                id=_binding_id(source_step, target_step, item_types, policy),
+                source_step=source_step,
+                target_step=target_step,
+                item_types=item_types,
+                policy=policy,
+            )
+            bindings[binding.id] = binding
+    return bindings
+
+
+@dataclass(frozen=True)
+class BrokerConfig:
+    """
+    configuration for a workflow run.
+
+    This contains all the static configuration that doesn't change during workflow execution.
+
+    Attributes:
+        steps: Configuration for each step indexed by step name
+        timeout: Maximum seconds before the workflow times out, or None for no timeout
+        catch_error_handlers: handler step name -> CatchErrorHandler descriptor
+        handler_for_step: step name -> handler step name that owns it
+        collection_bindings: Static list[E] stream bindings keyed by binding id
+    """
+
+    steps: dict[Any, InternalStepConfig]
+    timeout: float | None
+    catch_error_handlers: dict[Any, CatchErrorHandler] = field(default_factory=dict)
+    handler_for_step: dict[Any, StepId] = field(default_factory=dict)
+    collection_bindings: dict[str, CollectionBinding] = field(default_factory=dict)
+
+    @classmethod
+    def from_steps(
+        cls, step_configs: dict[str, StepConfig], timeout: float | None
+    ) -> BrokerConfig:
+        """Build worker configuration and routing from the same step declarations."""
+        handlers, routes = _collect_catch_error_handlers(step_configs)
+        return cls(
+            steps={
+                StepId.root(name): _internal_step_config(config)
+                for name, config in step_configs.items()
+            },
+            timeout=timeout,
+            catch_error_handlers={
+                StepId.root(name): handler for name, handler in handlers.items()
+            },
+            handler_for_step={
+                StepId.root(step_name): StepId.root(handler_name)
+                for step_name, handler_name in routes.items()
+            },
+            collection_bindings=_compute_collection_bindings(step_configs),
+        )
+
+    def __post_init__(self) -> None:
+        self._normalize_step_id_maps()
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._normalize_step_id_maps()
+        object.__setattr__(
+            self,
+            "collection_bindings",
+            {
+                binding_id: dataclasses.replace(
+                    binding,
+                    source_step=_normalize_step_id(binding.source_step),
+                    target_step=_normalize_step_id(binding.target_step),
+                )
+                if not isinstance(binding.source_step, StepId)
+                or not isinstance(binding.target_step, StepId)
+                else binding
+                for binding_id, binding in self.collection_bindings.items()
+            },
+        )
+
+    def _normalize_step_id_maps(self) -> None:
+        object.__setattr__(self, "steps", _normalize_step_id_keys(self.steps))
+        object.__setattr__(
+            self,
+            "catch_error_handlers",
+            _normalize_step_id_keys(self.catch_error_handlers),
+        )
+        object.__setattr__(
+            self,
+            "handler_for_step",
+            {
+                _normalize_step_id(step_id): _normalize_step_id(handler_id)
+                for step_id, handler_id in self.handler_for_step.items()
+            },
+        )
+
+    def bindings_for_source(self, source_step: StepId) -> tuple[CollectionBinding, ...]:
+        return tuple(
+            binding
+            for binding in self.collection_bindings.values()
+            if binding.source_step == source_step
+        )
+
+    def binding_for_target(
+        self,
+        stream_id: str,
+        target_step: StepId,
+        streams: dict[str, CollectionStreamInstance],
+    ) -> CollectionBinding | None:
+        stream = streams.get(stream_id)
+        if stream is None:
+            return None
+        for binding_id in stream.accepting_binding_ids:
+            binding = self.collection_bindings.get(binding_id)
+            if binding is not None and binding.target_step == target_step:
+                return binding
+        return None
+
+
+@dataclass()
+class InternalStepConfig:
+    """
+    Configuration for a single step in the workflow.
+
+    Attributes:
+        accepted_events: List of Event type classes this step can handle
+        retry_policy: Policy for retrying failed executions, or None for no retries
+        num_workers: Maximum number of concurrent executions of this step
+    """
+
+    accepted_events: list[Any]
+    retry_policy: RetryPolicy | None
+    num_workers: int
+    accept_event_subclasses: bool = False
+    collection_param: tuple[str, tuple[Any, ...]] | None = None
+    collect_params: list[tuple[str, Any]] | None = None
+    collection_policy: Collect | None = None
+
+
+@dataclass()
+class EventAttempt:
+    """
+    Represents an event that is being or will be processed by a step.
+
+    Tracks retry information for events that have failed and are being retried.
+
+    Attributes:
+        event: The event to process
+        attempts: Number of times this event has been attempted (0 for first attempt), or None if not yet attempted
+        first_attempt_at: Unix timestamp of first attempt, or None if not yet attempted
+        last_exception: Most recent exception, if this attempt is a retry.
+        last_failed_at: Unix timestamp of the most recent failure, or None.
+        not_before: Absolute adapter-get_now time before which this attempt
+            must not be dispatched (retry delay), or None if eligible now.
+        recovery_counts: Per-handler recovery counts on this event's lineage.
+        scope_path: Collection stream scope path, innermost stream id last.
+        collection_release_payload: Explicit payload for queued list[E] collect invocations.
+    """
+
+    event: Event
+    bound_events: dict[str, Event] | None = None
+    attempts: int | None = None
+    first_attempt_at: float | None = None
+    last_exception: Exception | None = None
+    last_failed_at: float | None = None
+    recovery_counts: dict[str, int] = field(default_factory=dict)
+    not_before: float | None = None
+    scope_path: tuple[str, ...] = field(default_factory=tuple)
+    collection_release_payload: CollectionReleasePayload | None = None
+    work_item_id: str | None = None
+
+    def _copy(self) -> EventAttempt:
+        return EventAttempt(
+            event=self.event,
+            bound_events=dict(self.bound_events) if self.bound_events else None,
+            attempts=self.attempts,
+            first_attempt_at=self.first_attempt_at,
+            last_exception=self.last_exception,
+            last_failed_at=self.last_failed_at,
+            recovery_counts=dict(self.recovery_counts),
+            not_before=self.not_before,
+            scope_path=self.scope_path,
+            collection_release_payload=self.collection_release_payload,
+            work_item_id=self.work_item_id,
+        )
+
+
+@dataclass()
+class InternalStepWorkerState:
+    """
+    Runtime state for a single step's worker pool.
+
+    This manages the queue of pending events, currently executing workers, and any
+    state needed for ctx.collect_events() and ctx.wait_for_event() operations.
+
+    Attributes:
+        queue: Events waiting to be processed by this step
+        config: Step configuration (includes retry policy, num_workers, etc.)
+        in_progress: Currently executing workers for this step
+        collected_events: Events being collected via ctx.collect_events(), keyed by buffer_id
+        collected_waiters: Active waiters created by ctx.wait_for_event()
+        collect_generations: Buffer counters bumped on each append or clear.
+            A changed counter means the invocation used a stale buffer.
+    """
+
+    queue: list[EventAttempt]
+    config: InternalStepConfig
+    in_progress: list[InProgressState]
+    collected_events: dict[str, list[Event]]
+    collected_waiters: list[StepWorkerWaiter]
+    static_collect_events: list[Event] = field(default_factory=list)
+    collect_generations: dict[str, int] = field(default_factory=dict)
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        if "collect_generations" not in state:
+            self.collect_generations = {}
+
+    def _deepcopy(self) -> InternalStepWorkerState:
+        return InternalStepWorkerState(
+            queue=[x._copy() for x in self.queue],
+            config=self.config,
+            in_progress=[x._deepcopy() for x in self.in_progress],
+            collected_events={k: list(v) for k, v in self.collected_events.items()},
+            static_collect_events=list(self.static_collect_events),
+            collected_waiters=[dataclasses.replace(x) for x in self.collected_waiters],
+            collect_generations=dict(self.collect_generations),
+        )
+
+    def bump_collect_generation(self, buffer_id: str) -> None:
+        """Bump the buffer counter after an append or clear."""
+        self.collect_generations[buffer_id] = (
+            self.collect_generations.get(buffer_id, 0) + 1
+        )
+
+
+@dataclass()
+class InProgressState:
+    """
+    Represents a single worker execution that is currently in progress.
+
+    Each worker gets a snapshot of the step's shared state at the time it starts.
+    This enables optimistic execution - if the shared state changes during execution
+    (e.g., new collected events arrive), the control loop can detect this and retry
+    the worker with the updated state.
+
+    Attributes:
+        event: The event being processed by this worker
+        worker_id: Numeric ID (0 to num_workers-1) identifying this worker slot
+        shared_state: Snapshot of collected_events and collected_waiters at worker start time
+        attempts: Number of times this event has been attempted (including current attempt)
+        first_attempt_at: Unix timestamp when this event was first attempted
+        last_exception: Most recent exception from the prior attempt, or None if this is the first attempt.
+        last_failed_at: Unix timestamp of the most recent failure, or None.
+        recovery_counts: Per-handler recovery counts on this event's lineage.
+        scope_path: Collection stream scope path for the worker's current event.
+        invocation_id: Dispatch ID assigned by the reducer. Older state and
+            tests may omit it.
+        received: Indexes of sends already routed for this invocation.
+        collect_generations: Buffer counters at dispatch time.
+    """
+
+    event: Event
+    worker_id: int
+    shared_state: StepWorkerState
+    attempts: int
+    first_attempt_at: float
+    last_exception: Exception | None = None
+    last_failed_at: float | None = None
+    recovery_counts: dict[str, int] = field(default_factory=dict)
+    bound_events: dict[str, Event] | None = None
+    scope_path: tuple[str, ...] = field(default_factory=tuple)
+    work_item_id: str | None = None
+    invocation_id: str | None = None
+    received: set[int] = field(default_factory=set)
+    collect_generations: dict[str, int] = field(default_factory=dict)
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.__dict__.setdefault("invocation_id", None)
+        self.__dict__.setdefault("received", set())
+        self.__dict__.setdefault("collect_generations", {})
+
+    def _deepcopy(self) -> InProgressState:
+        return InProgressState(
+            event=self.event,
+            bound_events=dict(self.bound_events) if self.bound_events else None,
+            worker_id=self.worker_id,
+            shared_state=self.shared_state._deepcopy(),
+            attempts=self.attempts,
+            first_attempt_at=self.first_attempt_at,
+            last_exception=self.last_exception,
+            last_failed_at=self.last_failed_at,
+            recovery_counts=dict(self.recovery_counts),
+            scope_path=self.scope_path,
+            work_item_id=self.work_item_id,
+            invocation_id=self.invocation_id,
+            received=set(self.received),
+            collect_generations=dict(self.collect_generations),
+        )
+
+
+def _serialize_release_payload(
+    payload: CollectionReleasePayload | None, serializer: BaseSerializer
+) -> SerializedCollectionReleasePayload | None:
+    """Serialize a queued list[E] collect invocation payload."""
+    if payload is None:
+        return None
+    return SerializedCollectionReleasePayload(
+        binding_id=payload.binding_id,
+        stream_id=payload.stream_id,
+        events=[serializer.serialize(ev) for ev in payload.events],
+        output_scope_path=list(payload.output_scope_path),
+    )
+
+
+def _deserialize_release_payload(
+    payload: SerializedCollectionReleasePayload | None, serializer: BaseSerializer
+) -> CollectionReleasePayload | None:
+    """Deserialize a queued list[E] collect invocation payload."""
+    if payload is None:
+        return None
+    return CollectionReleasePayload(
+        binding_id=payload.binding_id,
+        stream_id=payload.stream_id,
+        events=[serializer.deserialize(ev) for ev in payload.events],
+        output_scope_path=tuple(payload.output_scope_path),
+    )
